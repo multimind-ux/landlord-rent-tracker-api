@@ -216,6 +216,17 @@ def test_payment_updates_rent_status(client):
         headers=headers,
     ).status_code == 404
 
+    # Payment history is listed newest first and can be filtered.
+    history = client.get("/payments", headers=headers)
+    assert history.status_code == 200
+    assert len(history.json()) == 2
+    assert {payment["amount"] for payment in history.json()} == {400.0, 600.0}
+
+    filtered = client.get(
+        "/payments", params={"rent_record_id": record["id"]}, headers=headers
+    )
+    assert len(filtered.json()) == 2
+
 
 # ---------------------------------------------------------------------------
 # Overdue dashboard and summary

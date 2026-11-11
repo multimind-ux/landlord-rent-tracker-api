@@ -736,6 +736,21 @@ def delete_rent_record(
 # ---------------------------------------------------------------------------
 # Payments (protected)
 # ---------------------------------------------------------------------------
+@app.get("/payments", response_model=list[PaymentOut])
+def list_payments(
+    rent_record_id: int | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """List recorded payments (newest first), optionally for one rent record."""
+    query = db.query(Payment)
+    if rent_record_id is not None:
+        query = query.filter(Payment.rent_record_id == rent_record_id)
+    return query.order_by(Payment.date.desc()).offset(skip).limit(limit).all()
+
+
 @app.post("/payments", response_model=PaymentOut, status_code=status.HTTP_201_CREATED)
 def create_payment(
     payload: PaymentCreate,

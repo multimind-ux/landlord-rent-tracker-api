@@ -63,7 +63,7 @@ Tokens expire after 2 hours.
 | POST | `/tenants/{id}/move-out` | Move a tenant out and vacate the unit |
 | POST/GET | `/rent-records` | Create / list rent records |
 | GET/PUT/DELETE | `/rent-records/{id}` | Read / update / delete a rent record |
-| POST | `/payments` | Record a payment (partial or full) |
+| POST/GET | `/payments` | Record a payment / list payment history |
 | GET | `/dashboard/overdue` | Unpaid rent past its due date, with days overdue |
 | GET | `/dashboard/vacant` | Vacant units |
 | GET | `/dashboard/summary` | Expected, collected, outstanding, overdue tenants |
