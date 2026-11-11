@@ -1,0 +1,18 @@
+# Database files
+*.db
+*.db-journal
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Pytest cache
+.pytest_cache/
+
+# Environment secrets
+.env
