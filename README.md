@@ -1,6 +1,6 @@
 # Landlord Rent Tracker API
 
-A FastAPI backend for a landlord managing **one building**: 5 self-contain rooms and a twin flat (2 units). Built with **FastAPI**, **SQLAlchemy**, **SQLite**, and **JWT authentication**.
+A FastAPI backend for a landlord managing **one building**: 5 self-contain rooms and a twin flat (2 units). Built with **FastAPI**, **SQLAlchemy**, **SQLite/PostgreSQL**, and **JWT authentication**.
 
 ## Features
 
@@ -10,7 +10,7 @@ A FastAPI backend for a landlord managing **one building**: 5 self-contain rooms
 - Creating a tenant marks their unit **occupied**; moving them out marks it **vacant**
 - Payments update a rent record to **partial** or **paid**
 - Dashboards for overdue rent, vacant units, and totals
-- CORS enabled for `http://localhost:5173` (typical Vite frontend)
+- CORS enabled for the local Vite frontend and the deployed Vercel frontend
 
 ## Setup
 
@@ -40,7 +40,27 @@ uvicorn main:app --reload
 
 `rent_tracker.db` is created automatically, and the seven units are seeded on first start.
 
-> For production, set a strong `SECRET_KEY` environment variable instead of the development default.
+> For production, set a strong `SECRET_KEY` environment variable instead of the development default. Set `DATABASE_URL` to a PostgreSQL connection string to use a hosted database; otherwise the API falls back to SQLite.
+
+## Production deployment
+
+The API is deployed on Vercel with a Neon Postgres database:
+
+- API: <https://landlord-rent-tracker-api.vercel.app>
+- Swagger docs: <https://landlord-rent-tracker-api.vercel.app/docs>
+
+Vercel project: `multimind/landlord-rent-tracker-api`
+
+| Environment variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Neon Postgres connection string (local default: SQLite file) |
+| `SECRET_KEY` | JWT signing secret |
+
+Deploy from this directory with:
+
+```bash
+vercel --prod
+```
 
 ## Auth flow
 
