@@ -29,18 +29,38 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
+from sqlalchemy.pool import NullPool
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SQLALCHEMY_DATABASE_URL = "sqlite:///./rent_tracker.db"
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./rent_tracker.db")
+
+# SQLAlchemy defaults to psycopg2 for postgresql:// URLs; this project uses
+# psycopg 3, so make the driver explicit. Neon's DATABASE_URL also uses the
+# postgresql:// scheme.
+if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(
+        "postgres://", "postgresql+psycopg://", 1
+    )
+elif SQLALCHEMY_DATABASE_URL.startswith("postgresql://"):
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(
+        "postgresql://", "postgresql+psycopg://", 1
+    )
+
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 120
 
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
-)
+if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    )
+else:
+    # Serverless functions can scale out quickly; avoid holding idle
+    # connections open against the hosted database.
+    engine = create_engine(SQLALCHEMY_DATABASE_URL, poolclass=NullPool)
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 

@@ -1,0 +1,11 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-journal
+.pytest_cache/
+.env
+.env.*
+.vercel/
+test_main.py
