@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
+    Boolean,
     Column,
     Date,
     DateTime,
@@ -27,6 +28,8 @@ from sqlalchemy import (
     Integer,
     String,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -102,6 +105,9 @@ class User(Base):
     name = Column(String, nullable=False)
     email = Column(String, nullable=False, unique=True, index=True)
     hashed_password = Column(String, nullable=False)
+    must_change_password = Column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
 
 
 class Unit(Base):
@@ -173,6 +179,26 @@ class Payment(Base):
 Base.metadata.create_all(bind=engine)
 
 
+def ensure_user_schema() -> None:
+    """Add columns introduced after the first release to an existing users table."""
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "must_change_password" not in columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT TRUE"
+                )
+            )
+
+
+ensure_user_schema()
+
+
 def seed_units(db: Session) -> None:
     """Seed the building's seven units once (5 self-contain + 2 twin flat)."""
     if db.query(Unit).count() > 0:
@@ -228,6 +254,40 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(digest.hex(), expected)
 
 
+def seed_admin(db: Session) -> bool:
+    """Create the single landlord from env vars when there are no users.
+
+    Returns True when an account was created. The password is never logged.
+    """
+    if db.query(User).count() > 0:
+        return False
+
+    email = os.getenv("ADMIN_EMAIL", "").strip().lower()
+    password = os.getenv("ADMIN_PASSWORD", "")
+    if not email or not password:
+        print(
+            "No landlord account exists. Set ADMIN_EMAIL and ADMIN_PASSWORD "
+            "before starting the API to create one."
+        )
+        return False
+
+    db.add(
+        User(
+            name="Landlord",
+            email=email,
+            hashed_password=hash_password(password),
+            must_change_password=True,
+        )
+    )
+    db.commit()
+    return True
+
+
+# Seed the admin account on import/startup when the database has no users.
+with SessionLocal() as _db:
+    seed_admin(_db)
+
+
 def create_access_token(user: User) -> str:
     """Create a signed JWT for the landlord."""
     expires = datetime.now(timezone.utc) + timedelta(
@@ -270,12 +330,6 @@ def get_current_user(
 # ---------------------------------------------------------------------------
 # Pydantic schemas
 # ---------------------------------------------------------------------------
-class RegisterIn(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100)
-    email: str = Field(..., min_length=3, max_length=120)
-    password: str = Field(..., min_length=6, max_length=128)
-
-
 class LoginIn(BaseModel):
     email: str
     password: str
@@ -284,6 +338,16 @@ class LoginIn(BaseModel):
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    must_change_password: bool = False
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+class MessageOut(BaseModel):
+    message: str
 
 
 class UserOut(BaseModel):
@@ -292,6 +356,7 @@ class UserOut(BaseModel):
     id: int
     name: str
     email: str
+    must_change_password: bool
 
 
 class UnitCreate(BaseModel):
@@ -466,30 +531,9 @@ app.add_middleware(
 )
 
 
-@app.post("/auth/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterIn, db: Session = Depends(get_db)):
-    """Register the landlord. Only one account is allowed."""
-    if db.query(User).count() > 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Landlord account already exists",
-        )
-
-    email = payload.email.strip().lower()
-    user = User(
-        name=payload.name,
-        email=email,
-        hashed_password=hash_password(payload.password),
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
-
-
 @app.post("/auth/login", response_model=TokenOut)
 def login(payload: LoginIn, db: Session = Depends(get_db)):
-    """Log in with email and password to receive a JWT."""
+    """Log in with the admin-created email and password to receive a JWT."""
     email = payload.email.strip().lower()
     user = db.query(User).filter(User.email == email).first()
     if user is None or not verify_password(payload.password, user.hashed_password):
@@ -497,7 +541,34 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
         )
-    return TokenOut(access_token=create_access_token(user))
+    return TokenOut(
+        access_token=create_access_token(user),
+        must_change_password=bool(user.must_change_password),
+    )
+
+
+@app.post("/auth/change-password", response_model=MessageOut)
+def change_password(
+    payload: ChangePasswordIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Change the password for the logged-in landlord."""
+    if not verify_password(payload.current_password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+    if payload.current_password == payload.new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from the current password",
+        )
+
+    user.hashed_password = hash_password(payload.new_password)
+    user.must_change_password = False
+    db.commit()
+    return MessageOut(message="Password changed successfully")
 
 
 # ---------------------------------------------------------------------------

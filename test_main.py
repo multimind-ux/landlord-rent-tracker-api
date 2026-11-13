@@ -8,7 +8,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from main import Base, app, get_db, seed_units
+from main import (
+    Base,
+    User,
+    app,
+    get_db,
+    hash_password,
+    seed_admin,
+    seed_units,
+    verify_password,
+)
+
+TEST_EMAIL = "landlord@example.com"
+TEST_PASSWORD = "secret123"
 
 # Separate in-memory database so tests never touch rent_tracker.db.
 engine = create_engine(
@@ -21,10 +33,19 @@ TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=Fals
 
 @pytest.fixture()
 def client():
-    """Fresh database (with seeded units) and test client for each test."""
+    """Fresh database (with seeded units and landlord) and test client."""
     Base.metadata.create_all(bind=engine)
     with TestingSessionLocal() as db:
         seed_units(db)
+        db.add(
+            User(
+                name="Landlord",
+                email=TEST_EMAIL,
+                hashed_password=hash_password(TEST_PASSWORD),
+                must_change_password=False,
+            )
+        )
+        db.commit()
 
     def override_get_db():
         db = TestingSessionLocal()
@@ -41,12 +62,8 @@ def client():
     Base.metadata.drop_all(bind=engine)
 
 
-def auth_headers(client, email="landlord@example.com", password="secret123"):
-    """Register the landlord (once) and return Authorization headers."""
-    client.post(
-        "/auth/register",
-        json={"name": "Landlord", "email": email, "password": password},
-    )
+def auth_headers(client, email=TEST_EMAIL, password=TEST_PASSWORD):
+    """Log in and return Authorization headers."""
     response = client.post(
         "/auth/login", json={"email": email, "password": password}
     )
@@ -80,39 +97,25 @@ def create_rent_record(client, headers, tenant_id, amount_due=1000.0, due_date=N
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
-def test_register_login_and_protected_routes(client):
+def test_login_and_protected_routes(client):
     # Protected route rejects anonymous requests.
     assert client.get("/units").status_code == 401
-
-    # First registration succeeds, second is blocked.
-    first = client.post(
-        "/auth/register",
-        json={"name": "Landlord", "email": "landlord@example.com", "password": "secret123"},
-    )
-    assert first.status_code == 201
-    assert first.json()["email"] == "landlord@example.com"
-    assert "hashed_password" not in first.json()
-
-    duplicate = client.post(
-        "/auth/register",
-        json={"name": "Another", "email": "other@example.com", "password": "secret123"},
-    )
-    assert duplicate.status_code == 400
 
     # Wrong password is rejected, correct password returns a JWT.
     wrong = client.post(
         "/auth/login",
-        json={"email": "landlord@example.com", "password": "wrong-password"},
+        json={"email": TEST_EMAIL, "password": "wrong-password"},
     )
     assert wrong.status_code == 401
 
     login = client.post(
         "/auth/login",
-        json={"email": "landlord@example.com", "password": "secret123"},
+        json={"email": TEST_EMAIL, "password": TEST_PASSWORD},
     )
     assert login.status_code == 200
     assert login.json()["token_type"] == "bearer"
     assert login.json()["access_token"]
+    assert login.json()["must_change_password"] is False
 
     headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
     units = client.get("/units", headers=headers)
@@ -122,6 +125,114 @@ def test_register_login_and_protected_routes(client):
     # A garbage token is rejected.
     bad = client.get("/units", headers={"Authorization": "Bearer not-a-token"})
     assert bad.status_code == 401
+
+
+def test_register_endpoint_is_removed(client):
+    response = client.post(
+        "/auth/register",
+        json={
+            "name": "Another",
+            "email": "another@example.com",
+            "password": "secret123",
+        },
+    )
+    assert response.status_code == 404
+
+
+def test_startup_seed_creates_admin(client, monkeypatch, capsys):
+    with TestingSessionLocal() as db:
+        db.query(User).delete()
+        db.commit()
+
+        monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+        monkeypatch.setenv("ADMIN_PASSWORD", "startup-secret")
+
+        assert seed_admin(db) is True
+        user = db.query(User).one()
+        assert user.email == "admin@example.com"
+        assert user.must_change_password is True
+        assert verify_password("startup-secret", user.hashed_password)
+
+        # It must not create a second account on the next startup.
+        assert seed_admin(db) is False
+        assert db.query(User).count() == 1
+
+    captured = capsys.readouterr()
+    assert "startup-secret" not in captured.out
+
+
+def test_login_returns_must_change_password_flag(client):
+    with TestingSessionLocal() as db:
+        user = db.query(User).filter(User.email == TEST_EMAIL).one()
+        user.must_change_password = True
+        db.commit()
+
+    login = client.post(
+        "/auth/login",
+        json={"email": TEST_EMAIL, "password": TEST_PASSWORD},
+    )
+    assert login.status_code == 200
+    assert login.json()["must_change_password"] is True
+
+
+def test_change_password_rejects_wrong_current_password(client):
+    headers = auth_headers(client)
+    response = client.post(
+        "/auth/change-password",
+        json={
+            "current_password": "wrong-password",
+            "new_password": "brand-new-secret",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Current password is incorrect"
+
+    # The old password still works and the flag was not changed.
+    login = client.post(
+        "/auth/login",
+        json={"email": TEST_EMAIL, "password": TEST_PASSWORD},
+    )
+    assert login.status_code == 200
+    assert login.json()["must_change_password"] is False
+
+
+def test_change_password_success(client):
+    headers = auth_headers(client)
+    response = client.post(
+        "/auth/change-password",
+        json={
+            "current_password": TEST_PASSWORD,
+            "new_password": "brand-new-secret",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["message"] == "Password changed successfully"
+
+    old_login = client.post(
+        "/auth/login",
+        json={"email": TEST_EMAIL, "password": TEST_PASSWORD},
+    )
+    assert old_login.status_code == 401
+
+    new_login = client.post(
+        "/auth/login",
+        json={"email": TEST_EMAIL, "password": "brand-new-secret"},
+    )
+    assert new_login.status_code == 200
+    assert new_login.json()["must_change_password"] is False
+
+
+def test_change_password_requires_login(client):
+    response = client.post(
+        "/auth/change-password",
+        json={
+            "current_password": TEST_PASSWORD,
+            "new_password": "brand-new-secret",
+        },
+    )
+    assert response.status_code == 401
 
 
 # ---------------------------------------------------------------------------
