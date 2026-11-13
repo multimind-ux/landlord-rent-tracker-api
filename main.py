@@ -6,11 +6,13 @@ self-contain rooms. All unit, tenant and rent endpoints require a JWT.
 
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 
+import httpx
 import jwt
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -26,6 +28,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     create_engine,
     inspect,
@@ -33,6 +36,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -175,6 +180,57 @@ class Payment(Base):
     rent_record = relationship("RentRecord", back_populates="payments")
 
 
+class NotificationType(str, Enum):
+    due_soon = "due_soon"
+    due_today = "due_today"
+    overdue = "overdue"
+
+
+class Notification(Base):
+    """An in-app rent reminder for the landlord."""
+
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(SAEnum(NotificationType), nullable=False, index=True)
+    message = Column(String, nullable=False)
+    tenant_id = Column(
+        Integer,
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    rent_record_id = Column(
+        Integer,
+        ForeignKey("rent_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    is_read = Column(Boolean, nullable=False, default=False, index=True)
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
+    tenant = relationship("Tenant")
+    rent_record = relationship("RentRecord")
+
+
+class NotificationSettings(Base):
+    """The landlord's reminder preferences (a single row)."""
+
+    __tablename__ = "notification_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, nullable=False)
+    notify_days_before = Column(JSON, nullable=False, default=lambda: [7, 1])
+    notify_on_due_date = Column(Boolean, nullable=False, default=True)
+    overdue_reminder_every_days = Column(Integer, nullable=False, default=3)
+    email_enabled = Column(Boolean, nullable=False, default=True)
+
+
 # Create the tables on startup (fine for a small demo project).
 Base.metadata.create_all(bind=engine)
 
@@ -279,13 +335,31 @@ def seed_admin(db: Session) -> bool:
             must_change_password=True,
         )
     )
+    db.flush()
+    if db.query(NotificationSettings).count() == 0:
+        db.add(NotificationSettings(email=email))
     db.commit()
     return True
+
+
+def ensure_notification_settings(db: Session) -> None:
+    """Backfill the single settings row for an already-seeded landlord."""
+    if db.query(NotificationSettings).count() > 0:
+        return
+
+    user = db.query(User).order_by(User.id).first()
+    email = (user.email if user else os.getenv("ADMIN_EMAIL", "")).strip()
+    if not email:
+        return
+
+    db.add(NotificationSettings(email=email))
+    db.commit()
 
 
 # Seed the admin account on import/startup when the database has no users.
 with SessionLocal() as _db:
     seed_admin(_db)
+    ensure_notification_settings(_db)
 
 
 def create_access_token(user: User) -> str:
@@ -325,6 +399,29 @@ def get_current_user(
     if user is None:
         raise unauthorized
     return user
+
+
+cron_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_cron_secret(
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        cron_bearer_scheme
+    ),
+) -> None:
+    """Authorize the scheduled reminder job with CRON_SECRET, not a user JWT."""
+    cron_secret = os.getenv("CRON_SECRET", "")
+    if (
+        not cron_secret
+        or credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not hmac.compare_digest(credentials.credentials, cron_secret)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing cron secret",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +539,50 @@ class PaymentOut(BaseModel):
     date: datetime
 
 
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    type: NotificationType
+    message: str
+    tenant_id: int
+    rent_record_id: int
+    is_read: bool
+    created_at: datetime
+
+
+class UnreadCountOut(BaseModel):
+    unread_count: int
+
+
+class ReadAllOut(BaseModel):
+    updated: int
+
+
+class NotificationSettingsOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    notify_days_before: list[int]
+    notify_on_due_date: bool
+    overdue_reminder_every_days: int
+    email_enabled: bool
+
+
+class NotificationSettingsUpdate(BaseModel):
+    email: str | None = Field(None, min_length=3, max_length=200)
+    notify_days_before: list[int] | None = None
+    notify_on_due_date: bool | None = None
+    overdue_reminder_every_days: int | None = Field(None, ge=1, le=365)
+    email_enabled: bool | None = None
+
+
+class ReminderResultOut(BaseModel):
+    created: int
+    email_sent: bool
+
+
 class OverdueOut(BaseModel):
     rent_record_id: int
     tenant_id: int
@@ -512,6 +653,184 @@ def overdue_records(db: Session) -> list[RentRecord]:
         )
         .all()
     )
+
+
+def get_or_create_notification_settings(db: Session) -> NotificationSettings:
+    """Return the landlord's single settings row, creating it if needed."""
+    settings = (
+        db.query(NotificationSettings)
+        .order_by(NotificationSettings.id)
+        .first()
+    )
+    if settings is not None:
+        return settings
+
+    user = db.query(User).order_by(User.id).first()
+    email = (user.email if user else os.getenv("ADMIN_EMAIL", "")).strip()
+    settings = NotificationSettings(email=email)
+    db.add(settings)
+    db.commit()
+    db.refresh(settings)
+    return settings
+
+
+def notification_created_on(
+    db: Session,
+    rent_record_id: int,
+    notification_type: NotificationType,
+    day: date,
+) -> bool:
+    """Whether this record already has this rule's notification for the day."""
+    start = datetime.combine(day, datetime.min.time())
+    end = start + timedelta(days=1)
+    return (
+        db.query(Notification.id)
+        .filter(
+            Notification.rent_record_id == rent_record_id,
+            Notification.type == notification_type,
+            Notification.created_at >= start,
+            Notification.created_at < end,
+        )
+        .first()
+        is not None
+    )
+
+
+def last_overdue_notification(
+    db: Session, rent_record_id: int
+) -> Notification | None:
+    """Return the most recent overdue notification for a rent record."""
+    return (
+        db.query(Notification)
+        .filter(
+            Notification.rent_record_id == rent_record_id,
+            Notification.type == NotificationType.overdue,
+        )
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
+        .first()
+    )
+
+
+def reminder_type_for(
+    db: Session,
+    record: RentRecord,
+    settings: NotificationSettings,
+    today: date,
+) -> tuple[NotificationType | None, int]:
+    """Return the matching rule and days overdue (0 for non-overdue rules)."""
+    days_until_due = (record.due_date - today).days
+
+    if days_until_due == 0 and settings.notify_on_due_date:
+        return NotificationType.due_today, 0
+
+    try:
+        notify_days = {int(day) for day in (settings.notify_days_before or [])}
+    except (TypeError, ValueError):
+        notify_days = set()
+
+    if days_until_due > 0 and days_until_due in notify_days:
+        return NotificationType.due_soon, 0
+
+    if days_until_due < 0:
+        days_overdue = -days_until_due
+        every = max(1, int(settings.overdue_reminder_every_days or 3))
+        last = last_overdue_notification(db, record.id)
+        # The first overdue reminder is sent as soon as the record is overdue;
+        # later reminders repeat every `overdue_reminder_every_days` days.
+        if last is None or (today - last.created_at.date()).days >= every:
+            return NotificationType.overdue, days_overdue
+
+    return None, 0
+
+
+def build_notification_message(
+    record: RentRecord,
+    notification_type: NotificationType,
+    outstanding: float,
+    days_overdue: int,
+    today: date,
+) -> str:
+    """Create a human-readable message for an in-app reminder."""
+    tenant_name = record.tenant.name
+    unit_name = record.tenant.unit.name
+    amount = f"₦{outstanding:,.2f}"
+
+    if notification_type == NotificationType.due_today:
+        return (
+            f"Rent for {tenant_name} ({unit_name}) is due today: {amount}."
+        )
+    if notification_type == NotificationType.due_soon:
+        days = (record.due_date - today).days
+        return (
+            f"Rent for {tenant_name} ({unit_name}) is due in {days} "
+            f"day{'s' if days != 1 else ''} on "
+            f"{record.due_date.isoformat()}: {amount}."
+        )
+    return (
+        f"Rent for {tenant_name} ({unit_name}) is {days_overdue} "
+        f"day{'s' if days_overdue != 1 else ''} overdue "
+        f"(due {record.due_date.isoformat()}): {amount}."
+    )
+
+
+def send_reminder_email(
+    settings: NotificationSettings,
+    details: list[dict],
+    today: date,
+) -> bool:
+    """Send one summary email through Resend. Failures are logged, not raised."""
+    if not settings.email_enabled or not details:
+        return False
+
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    email_from = os.getenv("EMAIL_FROM", "").strip()
+    recipient = (settings.email or "").strip()
+    if not api_key or not email_from or not recipient:
+        logger.error(
+            "Reminder email skipped: RESEND_API_KEY, EMAIL_FROM, or "
+            "notification settings email is missing"
+        )
+        return False
+
+    lines = [f"Rent reminders for {today.isoformat()}", ""]
+    for detail in details:
+        if detail["type"] == NotificationType.overdue:
+            timing = (
+                f"{detail['days_overdue']} day"
+                f"{'s' if detail['days_overdue'] != 1 else ''} overdue"
+            )
+        elif detail["type"] == NotificationType.due_today:
+            timing = "due today"
+        else:
+            timing = f"due {detail['due_date'].isoformat()}"
+
+        lines.append(
+            f"- {detail['tenant_name']} ({detail['unit_name']}) — "
+            f"₦{detail['amount_owed']:,.2f} — {timing}"
+        )
+
+    payload = {
+        "from": email_from,
+        "to": [recipient],
+        "subject": f"Rent reminders for {today.isoformat()}",
+        "text": "\n".join(lines),
+    }
+
+    try:
+        response = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        return True
+    except Exception:
+        logger.exception("Failed to send reminder email via Resend")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1190,218 @@ def create_payment(
     db.commit()
     db.refresh(payment)
     return payment
+
+
+# ---------------------------------------------------------------------------
+# Notifications (protected)
+# ---------------------------------------------------------------------------
+@app.get("/notifications", response_model=list[NotificationOut])
+def list_notifications(
+    unread: bool | None = None,
+    is_read: bool | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """List notifications newest first, optionally filtered by read state."""
+    query = db.query(Notification)
+    if unread is not None:
+        query = query.filter(Notification.is_read == (not unread))
+    elif is_read is not None:
+        query = query.filter(Notification.is_read == is_read)
+
+    return (
+        query.order_by(Notification.created_at.desc(), Notification.id.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+
+@app.get("/notifications/unread-count", response_model=UnreadCountOut)
+def notification_unread_count(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Return the number of unread notifications."""
+    count = (
+        db.query(Notification)
+        .filter(Notification.is_read.is_(False))
+        .count()
+    )
+    return UnreadCountOut(unread_count=count)
+
+
+@app.post("/notifications/read-all", response_model=ReadAllOut)
+def mark_all_notifications_read(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Mark every unread notification as read."""
+    updated = (
+        db.query(Notification)
+        .filter(Notification.is_read.is_(False))
+        .update({Notification.is_read: True}, synchronize_session=False)
+    )
+    db.commit()
+    return ReadAllOut(updated=updated)
+
+
+@app.post("/notifications/{notification_id}/read", response_model=NotificationOut)
+def mark_notification_read(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Mark one notification as read."""
+    notification = db.get(Notification, notification_id)
+    if notification is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Notification with id {notification_id} not found",
+        )
+
+    notification.is_read = True
+    db.commit()
+    db.refresh(notification)
+    return notification
+
+
+@app.get("/notifications/settings", response_model=NotificationSettingsOut)
+def get_notification_settings(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Return the landlord's reminder settings."""
+    return get_or_create_notification_settings(db)
+
+
+@app.put("/notifications/settings", response_model=NotificationSettingsOut)
+def update_notification_settings(
+    payload: NotificationSettingsUpdate,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    """Update the landlord's reminder settings."""
+    settings = get_or_create_notification_settings(db)
+    values = {
+        field: value
+        for field, value in payload.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+
+    if "notify_days_before" in values:
+        days = values["notify_days_before"]
+        if any(day < 0 or day > 365 for day in days):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "notify_days_before must contain numbers between 0 and 365"
+                ),
+            )
+        values["notify_days_before"] = list(dict.fromkeys(days))
+
+    if "email" in values:
+        email = values["email"].strip()
+        if not email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="email must not be empty",
+            )
+        values["email"] = email
+
+    for field, value in values.items():
+        setattr(settings, field, value)
+
+    db.commit()
+    db.refresh(settings)
+    return settings
+
+
+# ---------------------------------------------------------------------------
+# Scheduled reminder job (CRON_SECRET bearer token, not a user JWT)
+# ---------------------------------------------------------------------------
+@app.api_route(
+    "/jobs/send-reminders",
+    methods=["GET", "POST"],
+    response_model=ReminderResultOut,
+    dependencies=[Depends(require_cron_secret)],
+)
+def send_reminders(db: Session = Depends(get_db)):
+    """Create due reminders and email one summary to the landlord.
+
+    Vercel Cron sends GET requests; POST is kept as the documented job method.
+    """
+    today = datetime.now(timezone.utc).date()
+    settings = get_or_create_notification_settings(db)
+    records = (
+        db.query(RentRecord)
+        .filter(
+            RentRecord.status.in_(
+                [RentStatus.unpaid, RentStatus.partial]
+            )
+        )
+        .all()
+    )
+
+    created_count = 0
+    email_details: list[dict] = []
+
+    for record in records:
+        outstanding = round(record.amount_due - record.amount_paid, 2)
+        if outstanding <= 0:
+            continue
+
+        notification_type, days_overdue = reminder_type_for(
+            db, record, settings, today
+        )
+        if notification_type is None:
+            continue
+        if notification_created_on(
+            db, record.id, notification_type, today
+        ):
+            continue
+
+        notification = Notification(
+            type=notification_type,
+            message=build_notification_message(
+                record,
+                notification_type,
+                outstanding,
+                days_overdue,
+                today,
+            ),
+            tenant_id=record.tenant_id,
+            rent_record_id=record.id,
+            is_read=False,
+        )
+        db.add(notification)
+        created_count += 1
+        email_details.append(
+            {
+                "type": notification_type,
+                "tenant_name": record.tenant.name,
+                "unit_name": record.tenant.unit.name,
+                "amount_owed": outstanding,
+                "due_date": record.due_date,
+                "days_overdue": days_overdue,
+            }
+        )
+
+    if created_count:
+        # Commit notifications before attempting email, so an email failure
+        # never loses the in-app reminders.
+        db.commit()
+
+    email_sent = False
+    if created_count:
+        try:
+            email_sent = send_reminder_email(settings, email_details, today)
+        except Exception:
+            logger.exception("Unexpected error while sending reminder email")
+
+    return ReminderResultOut(created=created_count, email_sent=email_sent)
 
 
 # ---------------------------------------------------------------------------
